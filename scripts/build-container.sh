@@ -75,7 +75,7 @@ if [[ ! $BIN ]];
 fi
 
 DIR=tmp/$BIN-$TYPE-$ARCH-$VERSION
-TAG=$BIN-$TYPE-$ARCH:$VERSION
+TAG=packom/$BIN-$TYPE-$ARCH:$VERSION
 
 echo "Creating container for"
 echo "  Binary:    $BIN"
@@ -86,20 +86,20 @@ echo "  Version:   $VERSION"
 echo "  Tag:       $TAG"
 echo "  Cert host: $CERT_HOST"
 
-rm -fr $DIR
-mkdir -p $DIR
 
 # need to run in build container
 # echo "cargo build $BUILD_TYPE --target $TARGET"
 # cargo build $BUILD_TYPE --target $TARGET
-echo "docker run --rm -ti -v $HOME/container-data/builds:/home/build/builds piersfinlayson/build /bin/bash -l -c \"cd /home/build/builds/gfa/$BIN && cargo build $BUILD_TYPE --target $TARGET\""
-docker run --rm -ti -v $HOME/container-data/builds:/home/build/builds piersfinlayson/build /bin/bash -l -c "cd /home/build/builds/gfa/$BIN && cargo build $BUILD_TYPE --target $TARGET"
+echo "docker run --rm -ti -v `pwd`:/home/build/builds piersfinlayson/build cargo build $BUILD_TYPE --target $TARGET"
+docker run --rm -ti -v `pwd`:/home/build/builds piersfinlayson/build cargo build $BUILD_TYPE --target $TARGET
 
+rm -fr $DIR
+mkdir -p $DIR
 echo "Getting binary: target/$TARGET/$TYPE/$BIN"
 cp target/$TARGET/$TYPE/$BIN $DIR/
 
-echo "Getting API: ../$BIN-api/api/openapi.yaml"
-cp ../$BIN-api/api/openapi.yaml $DIR/api.yaml
+echo "wget -O $DIR/api.yaml https://raw.githubusercontent.com/packom/pca9956b-api/master/api/openapi.yaml"
+wget -O $DIR/api.yaml https://raw.githubusercontent.com/packom/pca9956b-api/master/api/openapi.yaml
 
 if [[ $HTTPS == "https" ]];
   then
@@ -111,8 +111,8 @@ fi
 echo "Generating Dockerfile"
 echo "FROM scratch"
 echo "FROM scratch" > $DIR/Dockerfile
-echo "ADD api.yaml /static/"
-echo "ADD api.yaml /static/" >> $DIR/Dockerfile
+echo "ADD $TMP/api.yaml /static/"
+echo "ADD $TMP/api.yaml /static/" >> $DIR/Dockerfile
 if [[ $HTTPS == "https" ]];
   then
     echo "ADD key.pem /ssl/"
@@ -120,8 +120,8 @@ if [[ $HTTPS == "https" ]];
     echo "ADD cert.pem /ssl/"
     echo "ADD cert.pem /ssl/" >> $DIR/Dockerfile
 fi
-echo "ENV GFA_SERVER_PORT=8080"
-echo "ENV GFA_SERVER_PORT=8080" >> $DIR/Dockerfile
+echo "ENV SERVER_PORT=8080"
+echo "ENV SERVER_PORT=8080" >> $DIR/Dockerfile
 echo "EXPOSE 8080"
 echo "EXPOSE 8080" >> $DIR/Dockerfile
 # Add binary last as most likely thing to change
@@ -132,4 +132,4 @@ echo "CMD [\"/$BIN\"]" >> $DIR/Dockerfile
 
 echo "docker build -t $TAG $DIR"
 docker build -t $TAG $DIR 
-rm -fr $DIR
+rm -fr tmp
