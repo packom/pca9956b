@@ -24,7 +24,7 @@ use i2cbus_api::OkOrOther;
 use pca9956b_api;
 use pca9956b_api::models::{
     Addr, AddrEnabled, AddrIndex, AddrInfo, BadRequest, BusId, Config, Current, Error, Freq, Group,
-    LedError, LedIndex, LedInfo, LedState, Offset, OpError, OutputChange, Pwm, Sleep, Yaml,
+    LedError, LedIndex, LedInfo, LedInfoArray, LedState, Offset, OpError, OutputChange, Pwm, Sleep, Yaml,
 };
 use pca9956b_api::{
     Api, ApiError, ClearErrorResponse, GetAddrEnabledResponse, GetAddrInfoResponse,
@@ -41,17 +41,17 @@ use pca9956b_api::{
 use std::{error, fmt, thread};
 use httpd_util;
 
-use futures::sync::{mpsc, oneshot};
 use futures::{
     future::{self, failed, ok, Either},
     Future, stream, Stream,
 };
 use std::fs;
 use std::env;
-use std::sync::Mutex;
-use swagger::{AuthData, ContextBuilder, EmptyContext, Has, Push, XSpanIdString};
-use tokio_core::reactor;
 use uuid;
+use log::{debug, info, warn};
+
+use lazy_static::lazy_static;
+use static_assertions::{const_assert};
 
 const NUM_LEDS: u32 = 24;
 const REG_MODE1: u8 = 0x00;
@@ -428,7 +428,7 @@ macro_rules! handle_i2cbus_response {
 
 fn i2cbus_response_to_ok_err<T>(
     i2c_rsp: Result<T, ApiError>,
-) -> Box<Future<Item = OkData, Error = I2cHandlingError>>
+) -> Box<dyn Future<Item = OkData, Error = I2cHandlingError> + Send>
 where
     T: i2cbus_api::OkOrOther,
 {
@@ -503,7 +503,7 @@ fn get_reg_val(
     bus_id: &BusId,
     addr: &Addr,
     reg: &u8,
-) -> Box<Future<Item = u8, Error = I2cHandlingError>> {
+) -> Box<dyn Future<Item = u8, Error = I2cHandlingError> + Send> {
     Box::new(
         I2CBUS_HANDLE
             .i2c_bus_read_reg(
@@ -528,7 +528,7 @@ fn set_reg_val(
     addr: &Addr,
     reg: &u8,
     val: &u8,
-) -> Box<Future<Item = (), Error = I2cHandlingError>> {
+) -> Box<dyn Future<Item = (), Error = I2cHandlingError> + Send> {
     Box::new(
         I2CBUS_HANDLE
             .i2c_bus_write_byte_reg(
@@ -570,7 +570,7 @@ macro_rules! make_bit_get {
         pub(crate) fn $fn(
             bus_id: BusId,
             addr: Addr,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?}", stringify!($fn), bus_id, addr);
             Box::new(
                 get_reg_val(&bus_id, &addr, &$reg_c)
@@ -587,7 +587,7 @@ macro_rules! make_bit_get {
             bus_id: BusId,
             addr: Addr,
             extra: $extra_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?}", stringify!($fn), bus_id, addr, extra);
             Box::new(
                 bounds_check!(extra, $extra, $extra_test_fn, $rsp_ty, {
@@ -609,7 +609,7 @@ macro_rules! make_bit_set {
             bus_id: BusId,
             addr: Addr,
             input_var: $input_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?}", stringify!($fn), bus_id, addr, input_var);
             Box::new(
                 get_reg_val(&bus_id, &addr, &$reg_c)
@@ -632,7 +632,7 @@ macro_rules! make_bit_set {
             addr: Addr,
             extra: $extra_ty,
             input_var: $input_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?} {:?}", stringify!($fn), bus_id, addr, extra, input_var);
             Box::new(
                 bounds_check!(extra, $extra, $extra_test_fn, $rsp_ty, {
@@ -665,7 +665,7 @@ macro_rules! make_reg_get {
         pub(crate) fn $fn(
             bus_id: BusId,
             addr: Addr,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?}", stringify!($fn), bus_id, addr);
             Box::new(
                 get_reg_val(&bus_id, &addr, &$reg_c)
@@ -681,7 +681,7 @@ macro_rules! make_reg_get {
             bus_id: BusId,
             addr: Addr,
             extra: $extra_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?}", stringify!($fn), bus_id, addr, extra);
             Box::new(
                 bounds_check!(extra, $extra, $extra_test_fn, $rsp_ty, {
@@ -702,7 +702,7 @@ macro_rules! make_reg_set {
             bus_id: BusId,
             addr: Addr,
             input_var: $input_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?}", stringify!($fn), bus_id, addr, input_var);
             Box::new({
                 bounds_check!(input_var, $input_var, $test_fn, $rsp_ty, {
@@ -726,7 +726,7 @@ macro_rules! make_reg_set {
             addr: Addr,
             extra: $extra_ty,
             input_var: $input_ty,
-        ) -> Box<Future<Item = $rsp_ty, Error = ApiError>> {
+        ) -> Box<dyn Future<Item = $rsp_ty, Error = ApiError> + Send> {
             info!("API {} : {:?} {:?} {:?} {:?}", stringify!($fn), bus_id, addr, extra, input_var);
             Box::new(
                 bounds_check!(extra, $extra, $extra_test_fn, $rsp_ty, {
@@ -817,7 +817,7 @@ fn set_reg_from_error_val(val: &Error, old_reg: &u8, bit: &u8) -> u8 {
     new_reg_val | (u8::from(val) << bit)
 }
 
-pub(crate) fn get_api() -> Box<Future<Item = GetApiResponse, Error = ApiError>> {
+pub(crate) fn get_api() -> Box<dyn Future<Item = GetApiResponse, Error = ApiError> + Send> {
     // Read in the file
     info!("API get_api");
     let rsp = match fs::read("/static/api.yaml") {
@@ -836,7 +836,7 @@ pub(crate) fn get_api() -> Box<Future<Item = GetApiResponse, Error = ApiError>> 
     Box::new(ok(rsp))
 }
 
-pub(crate) fn reset(bus_id: BusId) -> Box<Future<Item = ResetResponse, Error = ApiError>> {
+pub(crate) fn reset(bus_id: BusId) -> Box<dyn Future<Item = ResetResponse, Error = ApiError> + Send> {
     let bus_id: i32 = bus_id.into();
     info!("API reset : {:?}", bus_id);
     Box::new({
@@ -1310,7 +1310,7 @@ pub(crate) fn get_addr_info(
     bus_id: BusId,
     addr: Addr,
     num: AddrIndex,
-) -> Box<Future<Item = GetAddrInfoResponse, Error = ApiError>> {
+) -> Box<dyn Future<Item = GetAddrInfoResponse, Error = ApiError> + Send> {
     info!("API get_addr_info : {:?} {:?} {:?}", bus_id, addr, num);
     Box::new(bounds_check!(
         num,
@@ -1363,7 +1363,7 @@ pub(crate) fn get_led_info(
     bus_id: BusId,
     addr: Addr,
     led: LedIndex,
-) -> Box<Future<Item = GetLedInfoResponse, Error = ApiError>> {
+) -> Box<dyn Future<Item = GetLedInfoResponse, Error = ApiError> + Send> {
     info!("API get_led_info : {:?} {:?} {:?}", bus_id, addr, led);
     Box::new(bounds_check!(
         led,
@@ -1467,7 +1467,7 @@ pub(crate) fn get_led_info(
 pub(crate) fn get_led_info_all(
     bus_id: BusId,
     addr: Addr,
-) -> Box<Future<Item = GetLedInfoAllResponse, Error = ApiError>> {
+) -> Box<dyn Future<Item = GetLedInfoAllResponse, Error = ApiError> + Send> {
     info!("API get_led_info : {:?} {:?}", bus_id, addr);
     let range = 0..24;
     let s = stream::unfold(range.into_iter(), move |mut vals| 
@@ -1490,7 +1490,7 @@ pub(crate) fn get_led_info_all(
     ).collect();
     let rsp = s.wait();
     let rsp = match rsp {
-        Ok(rsp) => GetLedInfoAllResponse::OK(rsp),
+        Ok(rsp) => GetLedInfoAllResponse::OK(rsp.into()),
         Err(e) => GetLedInfoAllResponse::OperationFailed(OpError { error: Some(format!("Failed to collect LED info: {:?}", e))}),
     };
     info!("API get_led_info -> {:?}", rsp);
@@ -1513,7 +1513,7 @@ DONE addr -> SUBADR1/2/3 -> Vec<models::AdrInfo{ index: Option<u32>, enabled: Op
 pub(crate) fn get_config(
     bus_id: BusId,
     addr: Addr,
-) -> Box<Future<Item = GetConfigResponse, Error = ApiError>> {
+) -> Box<dyn Future<Item = GetConfigResponse, Error = ApiError> + Send> {
     let bus_id: i32 = bus_id.into();
     let addr: i32 = addr.into();
     let config = Config::new();

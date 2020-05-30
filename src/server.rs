@@ -1,30 +1,82 @@
-//! Server implementation of openapi_client.
+//! Main library entry point for pca9956b_api implementation.
+
 #![allow(unused_imports)]
 
-extern crate pca9956b_api;
-extern crate swagger;
+mod errors {
+    error_chain::error_chain!{}
+}
+
+pub use self::errors::*;
 
 use chrono;
-use futures::{self, Future};
-use std::collections::HashMap;
+use futures::{future, Future, Stream};
+use hyper::server::conn::Http;
+use hyper::service::MakeService as _;
+use log::{info, warn};
+use openssl::ssl::SslAcceptorBuilder;
 use std::marker::PhantomData;
-
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use swagger;
 use swagger::{Has, XSpanIdString};
-use crate::http;
+use swagger::auth::MakeAllowAllAuthenticator;
+use swagger::EmptyContext;
+use tokio::net::TcpListener;
+
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios")))]
+use tokio_openssl::SslAcceptorExt;
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios")))]
+use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 
 use pca9956b_api::models;
-use pca9956b_api::{
-    Api, ApiError, ClearErrorResponse, GetAddrEnabledResponse, GetAddrInfoResponse,
-    GetAddrValueResponse, GetApiResponse, GetConfigResponse, GetCurrentResponse, GetErrorResponse,
-    GetErrorsResponse, GetFreqResponse, GetGroupResponse, GetLedCurrentResponse,
-    GetLedErrorResponse, GetLedInfoAllResponse, GetLedInfoResponse, GetLedPwmResponse,
-    GetLedStateResponse, GetOffsetResponse, GetOutputChangeResponse, GetOverTempResponse,
-    GetPwmResponse, GetSleepResponse, ResetResponse, SetAddrEnabledResponse, SetAddrValueResponse,
-    SetConfigResponse, SetCurrentResponse, SetFreqResponse, SetGroupResponse,
-    SetLedCurrentResponse, SetLedErrorResponse, SetLedInfoAllResponse, SetLedInfoResponse,
-    SetLedPwmResponse, SetLedStateResponse, SetOffsetResponse, SetOutputChangeResponse,
-    SetPwmResponse, SetSleepResponse,
-};
+
+mod http;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios")))]
+/// Builds an SSL implementation for Simple HTTPS from some hard-coded file names
+pub fn create(addr: &str, ssl: Option<SslAcceptorBuilder>) -> Box<dyn Future<Item = (), Error = ()> + Send> {
+    let addr = addr.parse().expect("Failed to parse bind address");
+
+    let server = Server::new();
+
+    let service_fn = MakeService::new(server);
+
+    let service_fn = MakeAllowAllAuthenticator::new(service_fn, "cosmo");
+
+    let service_fn =
+        pca9956b_api::server::context::MakeAddContext::<_, EmptyContext>::new(
+            service_fn
+        );
+
+    match ssl {
+        Some(ssl) => {
+            let tls_acceptor = ssl.build();
+            let service_fn = Arc::new(Mutex::new(service_fn));
+            let tls_listener = TcpListener::bind(&addr).unwrap().incoming().for_each(move |tcp| {
+                let addr = tcp.peer_addr().expect("Unable to get remote address");
+
+                let service_fn = service_fn.clone();
+
+                hyper::rt::spawn(tls_acceptor.accept_async(tcp).map_err(|_| ()).and_then(move |tls| {
+                    let ms = {
+                        let mut service_fn = service_fn.lock().unwrap();
+                        service_fn.make_service(&addr)
+                    };
+
+                    ms.and_then(move |service| {
+                        Http::new().serve_connection(tls, service)
+                    }).map_err(|_| ())
+                }));
+
+                Ok(())
+            }).map_err(|_| ());
+
+            Box::new(tls_listener)
+        },
+        None => Box::new(hyper::server::Server::bind(&addr).serve(service_fn).map_err(|e| panic!("{:?}", e))),
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct Server<C> {
@@ -33,11 +85,54 @@ pub struct Server<C> {
 
 impl<C> Server<C> {
     pub fn new() -> Self {
-        Server {
-            marker: PhantomData,
-        }
+        Server{marker: PhantomData}
     }
 }
+
+use pca9956b_api::{
+    Api,
+    ApiError,
+    ClearErrorResponse,
+    GetAddrEnabledResponse,
+    GetAddrInfoResponse,
+    GetAddrValueResponse,
+    GetApiResponse,
+    GetConfigResponse,
+    GetCurrentResponse,
+    GetErrorResponse,
+    GetErrorsResponse,
+    GetFreqResponse,
+    GetGroupResponse,
+    GetLedCurrentResponse,
+    GetLedErrorResponse,
+    GetLedInfoResponse,
+    GetLedInfoAllResponse,
+    GetLedPwmResponse,
+    GetLedStateResponse,
+    GetOffsetResponse,
+    GetOutputChangeResponse,
+    GetOverTempResponse,
+    GetPwmResponse,
+    GetSleepResponse,
+    ResetResponse,
+    SetAddrEnabledResponse,
+    SetAddrValueResponse,
+    SetConfigResponse,
+    SetCurrentResponse,
+    SetFreqResponse,
+    SetGroupResponse,
+    SetLedCurrentResponse,
+    SetLedErrorResponse,
+    SetLedInfoResponse,
+    SetLedInfoAllResponse,
+    SetLedPwmResponse,
+    SetLedStateResponse,
+    SetOffsetResponse,
+    SetOutputChangeResponse,
+    SetPwmResponse,
+    SetSleepResponse,
+};
+use pca9956b_api::server::MakeService;
 
 impl<C> Api<C> for Server<C>
 where
@@ -48,7 +143,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = ClearErrorResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = ClearErrorResponse, Error = ApiError> + Send> {
         http::clear_error(bus_id.into(), addr.into(), true.into())
     }
 
@@ -58,7 +153,7 @@ where
         addr: i32,
         num: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetAddrEnabledResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetAddrEnabledResponse, Error = ApiError> + Send> {
         http::get_addr_enabled(bus_id.into(), addr.into(), num.into())
     }
 
@@ -68,7 +163,7 @@ where
         addr: i32,
         num: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetAddrInfoResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetAddrInfoResponse, Error = ApiError> + Send> {
         http::get_addr_info(bus_id.into(), addr.into(), num.into())
     }
 
@@ -78,11 +173,11 @@ where
         addr: i32,
         num: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetAddrValueResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetAddrValueResponse, Error = ApiError> + Send> {
         http::get_addr_value(bus_id.into(), addr.into(), num.into())
     }
 
-    fn get_api(&self, _context: &C) -> Box<Future<Item = GetApiResponse, Error = ApiError>> {
+    fn get_api(&self, _context: &C) -> Box<dyn Future<Item = GetApiResponse, Error = ApiError> + Send> {
         http::get_api()
     }
 
@@ -91,7 +186,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetConfigResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetConfigResponse, Error = ApiError> + Send> {
         info!(
             "get_config({}, {})",
             bus_id,
@@ -105,7 +200,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetCurrentResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetCurrentResponse, Error = ApiError> + Send> {
         http::get_current(bus_id.into(), addr.into())
     }
 
@@ -114,7 +209,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetErrorResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetErrorResponse, Error = ApiError> + Send> {
         http::get_error(bus_id.into(), addr.into())
     }
 
@@ -123,7 +218,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetErrorsResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetErrorsResponse, Error = ApiError> + Send> {
         info!(
             "get_errors({}, {})",
             bus_id,
@@ -137,7 +232,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetFreqResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetFreqResponse, Error = ApiError> + Send> {
         http::get_freq(bus_id.into(), addr.into())
     }
 
@@ -146,7 +241,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetGroupResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetGroupResponse, Error = ApiError> + Send> {
         http::get_group(bus_id.into(), addr.into())
     }
 
@@ -156,7 +251,7 @@ where
         addr: i32,
         led: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedCurrentResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedCurrentResponse, Error = ApiError> + Send> {
         http::get_led_current(bus_id.into(), addr.into(), led.into())
     }
 
@@ -166,7 +261,7 @@ where
         addr: i32,
         led: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedErrorResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedErrorResponse, Error = ApiError> + Send> {
         http::get_led_error(bus_id.into(), addr.into(), led.into())
     }
 
@@ -176,7 +271,7 @@ where
         addr: i32,
         led: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedInfoResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedInfoResponse, Error = ApiError> + Send> {
         http::get_led_info(bus_id.into(), addr.into(), led.into())
     }
 
@@ -185,7 +280,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedInfoAllResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedInfoAllResponse, Error = ApiError> + Send> {
         info!(
             "get_led_info_all({}, {})",
             bus_id,
@@ -200,7 +295,7 @@ where
         addr: i32,
         led: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedPwmResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedPwmResponse, Error = ApiError> + Send> {
         http::get_led_pwm(bus_id.into(), addr.into(), led.into())
     }
 
@@ -210,7 +305,7 @@ where
         addr: i32,
         led: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetLedStateResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetLedStateResponse, Error = ApiError> + Send> {
         http::get_led_state(bus_id.into(), addr.into(), led.into())
     }
 
@@ -219,7 +314,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetOffsetResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetOffsetResponse, Error = ApiError> + Send> {
 
         http::get_offset(bus_id.into(), addr.into())
     }
@@ -229,7 +324,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetOutputChangeResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetOutputChangeResponse, Error = ApiError> + Send> {
         http::get_output_change(bus_id.into(), addr.into())
     }
 
@@ -238,7 +333,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetOverTempResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetOverTempResponse, Error = ApiError> + Send> {
         info!(
             "get_over_temp({}, {})",
             bus_id,
@@ -252,7 +347,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetPwmResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetPwmResponse, Error = ApiError> + Send> {
         http::get_pwm(bus_id.into(), addr.into())
     }
 
@@ -261,7 +356,7 @@ where
         bus_id: i32,
         addr: i32,
         _context: &C,
-    ) -> Box<Future<Item = GetSleepResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = GetSleepResponse, Error = ApiError> + Send> {
         http::get_sleep(bus_id.into(), addr.into())
     }
 
@@ -269,7 +364,7 @@ where
         &self,
         bus_id: i32,
         _context: &C,
-    ) -> Box<Future<Item = ResetResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = ResetResponse, Error = ApiError> + Send> {
         http::reset(bus_id.into())
     }
 
@@ -280,7 +375,7 @@ where
         num: i32,
         enabled: bool,
         _context: &C,
-    ) -> Box<Future<Item = SetAddrEnabledResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetAddrEnabledResponse, Error = ApiError> + Send> {
         http::set_addr_enabled(bus_id.into(), addr.into(), num.into(), enabled.into())
     }
 
@@ -291,7 +386,7 @@ where
         num: i32,
         addr_val: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetAddrValueResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetAddrValueResponse, Error = ApiError> + Send> {
         http::set_addr_value(bus_id.into(), addr.into(), num.into(), addr_val.into())
     }
 
@@ -301,7 +396,7 @@ where
         addr: i32,
         config: models::Config,
         _context: &C,
-    ) -> Box<Future<Item = SetConfigResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetConfigResponse, Error = ApiError> + Send> {
         info!(
             "set_config({}, {}, {:?})",
             bus_id,
@@ -317,7 +412,7 @@ where
         addr: i32,
         current: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetCurrentResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetCurrentResponse, Error = ApiError> + Send> {
         http::set_current(bus_id.into(), addr.into(), current.into())
     }
 
@@ -327,7 +422,7 @@ where
         addr: i32,
         freq: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetFreqResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetFreqResponse, Error = ApiError> + Send> {
         http::set_freq(bus_id.into(), addr.into(), freq.into())
     }
 
@@ -337,7 +432,7 @@ where
         addr: i32,
         group: models::Group,
         _context: &C,
-    ) -> Box<Future<Item = SetGroupResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetGroupResponse, Error = ApiError> + Send> {
         http::set_group(bus_id.into(), addr.into(), group.into())
     }
 
@@ -348,7 +443,7 @@ where
         led: i32,
         current: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetLedCurrentResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedCurrentResponse, Error = ApiError> + Send> {
         http::set_led_current(bus_id.into(), addr.into(), led.into(), current.into())
     }
 
@@ -359,7 +454,7 @@ where
         led: i32,
         error: models::LedError,
         _context: &C,
-    ) -> Box<Future<Item = SetLedErrorResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedErrorResponse, Error = ApiError> + Send> {
         info!(
             "set_led_error({}, {}, {}, {:?})",
             bus_id,
@@ -378,7 +473,7 @@ where
         led: i32,
         led_info: models::LedInfo,
         _context: &C,
-    ) -> Box<Future<Item = SetLedInfoResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedInfoResponse, Error = ApiError> + Send> {
         info!(
             "set_led_info({}, {}, {}, {:?})",
             bus_id,
@@ -393,9 +488,9 @@ where
         &self,
         bus_id: i32,
         addr: i32,
-        led_info: &Vec<models::LedInfo>,
+        led_info: models::LedInfoArray,
         _context: &C,
-    ) -> Box<Future<Item = SetLedInfoAllResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedInfoAllResponse, Error = ApiError> + Send> {
         info!(
             "set_led_info_all({}, {}, {:?})",
             bus_id,
@@ -412,7 +507,7 @@ where
         led: i32,
         pwm: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetLedPwmResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedPwmResponse, Error = ApiError> + Send> {
         http::set_led_pwm(bus_id.into(), addr.into(), led.into(), pwm.into())
     }
 
@@ -423,7 +518,7 @@ where
         led: i32,
         state: models::LedState,
         _context: &C,
-    ) -> Box<Future<Item = SetLedStateResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetLedStateResponse, Error = ApiError> + Send> {
         http::set_led_state(bus_id.into(), addr.into(), led.into(), state.into())
     }
 
@@ -433,7 +528,7 @@ where
         addr: i32,
         offset: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetOffsetResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetOffsetResponse, Error = ApiError> + Send> {
         http::set_offset(bus_id.into(), addr.into(), offset.into())
     }
 
@@ -443,7 +538,7 @@ where
         addr: i32,
         output_change: models::OutputChange,
         _context: &C,
-    ) -> Box<Future<Item = SetOutputChangeResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetOutputChangeResponse, Error = ApiError> + Send> {
         http::set_output_change(bus_id.into(), addr.into(), output_change.into())
     }
 
@@ -453,7 +548,7 @@ where
         addr: i32,
         pwm: i32,
         _context: &C,
-    ) -> Box<Future<Item = SetPwmResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetPwmResponse, Error = ApiError> + Send> {
         http::set_pwm(bus_id.into(), addr.into(), pwm.into())
     }
 
@@ -463,7 +558,7 @@ where
         addr: i32,
         sleep: bool,
         _context: &C,
-    ) -> Box<Future<Item = SetSleepResponse, Error = ApiError>> {
+    ) -> Box<dyn Future<Item = SetSleepResponse, Error = ApiError> + Send> {
         http::set_sleep(bus_id.into(), addr.into(), sleep.into())
     }
 }
