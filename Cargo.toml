@@ -19,7 +19,7 @@ travis-ci = { repository = "packom/pca9956b", branch = "master" }
 [dependencies]
 httpd-util = "0.1"
 i2cdev2 = "0.4.0"
-i2cbus-api = {version = "0.1.8"}
+i2cbus-api = {version = "0.1.9"}
 pca9956b-api = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.1" # 0.3 incompatible
